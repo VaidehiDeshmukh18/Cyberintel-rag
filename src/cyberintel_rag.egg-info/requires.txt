@@ -1,0 +1,14 @@
+pydantic>=2.5
+pydantic-settings>=2.1
+python-dotenv>=1.0
+loguru>=0.7
+httpx>=0.26
+requests>=2.31
+tqdm>=4.66
+orjson>=3.9
+transformers>=4.40
+
+[dev]
+pytest>=7.4
+pytest-cov>=4.1
+ruff>=0.1

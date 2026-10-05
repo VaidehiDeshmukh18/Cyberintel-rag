@@ -26,11 +26,6 @@ class DocumentMetadata(BaseModel):
       * metadata filtering in Qdrant ("CVEs after 2024", "ransomware only")
       * display in the Streamlit UI
       * citation back to the source document
-
-    Design note: we use `Literal` types for closed-vocabulary fields
-    (source, document_type, ransomware_use) so Pydantic rejects any
-    unexpected value loudly at ingestion time rather than silently
-    corrupting the index.
     """
 
     # --- Identity ------------------------------------------------------
@@ -50,33 +45,21 @@ class DocumentMetadata(BaseModel):
     # --- Threat signals ------------------------------------------------
     ransomware_use: Optional[Literal["Known", "Unknown"]] = None
 
+    # --- References (URLs extracted from source for citation) ---------
+    references: list[str] = Field(default_factory=list)
+
 
 # ---------------------------------------------------------------------------
 # Document
 # ---------------------------------------------------------------------------
 
 class Document(BaseModel):
-    """A single normalized document, ready for chunking and indexing.
-
-    Attributes
-    ----------
-    document_id : str
-        Globally unique key. For CISA KEV we use the CVE ID itself
-        (e.g. "CVE-2021-44228"); for MITRE we will later use the
-        technique ID (e.g. "T1055"). Chunk IDs derive from this as
-        "{document_id}::chunk_{n}".
-    content : str
-        The text that will be embedded. For KEV, this is the stitched
-        passage of vulnerabilityName + shortDescription + requiredAction
-        + notes. No dates, no raw IDs — those belong in metadata.
-    metadata : DocumentMetadata
-        Structured fields kept alongside the content.
-    """
+    """A single normalized document, ready for chunking and indexing."""
 
     document_id: str
     content: str
     metadata: DocumentMetadata
 
-    def __repr__(self) -> str:  # cleaner printing during debugging
+    def __repr__(self) -> str:
         preview = self.content[:60].replace("\n", " ")
         return f"Document(id={self.document_id!r}, content={preview!r}...)"

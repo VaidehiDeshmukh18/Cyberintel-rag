@@ -1,21 +1,18 @@
 """CISA Known Exploited Vulnerabilities (KEV) loader.
 
 Reads the raw KEV JSON feed from disk and normalizes each vulnerability
-record into a `Document` object. The loader is deliberately strict: if a
-record is missing required fields or contains an unexpected value, it is
-logged and skipped rather than silently coerced. This keeps the index
-clean and surfaces upstream data issues early.
+record into a `Document` object. URLs are extracted from the raw text
+and moved to `metadata.references` so they can be shown as citations
+without diluting the embeddings.
 
 Usage (from project root, venv active):
     python -m src.ingestion.loaders.cisa_kev_loader
-
-Writes:
-    data/processed/documents.jsonl   (one Document per line)
 """
 
 from __future__ import annotations
 
 import json
+import re
 from datetime import date, datetime
 from pathlib import Path
 from typing import Iterator, Optional
@@ -38,11 +35,35 @@ OUT_PATH = Path("data/processed/documents.jsonl")
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _clean(text: Optional[str]) -> str:
-    """Normalize whitespace and strip. Returns empty string for None."""
+# Matches http:// or https:// URLs. Simple but robust enough for KEV notes,
+# which already use well-formed URLs.
+_URL_RE = re.compile(r"https?://\S+")
+
+
+def _extract_urls(text: Optional[str]) -> list[str]:
+    """Return every URL found in `text`, in order of appearance.
+
+    Trailing punctuation (periods, commas, semicolons, parentheses) is
+    stripped so a URL at the end of a sentence doesn't carry a '.' into
+    its stored form.
+    """
+    if not text:
+        return []
+    urls = _URL_RE.findall(text)
+    return [u.rstrip(".,;:)]'\"") for u in urls]
+
+
+def _strip_urls(text: Optional[str]) -> str:
+    """Remove URLs from `text` so they don't dilute the embeddings."""
     if not text:
         return ""
-    # collapse any run of whitespace (newlines, tabs, multi-spaces) into one space
+    return _URL_RE.sub("", text)
+
+
+def _clean(text: Optional[str]) -> str:
+    """Collapse whitespace and strip. Returns empty string for None."""
+    if not text:
+        return ""
     return " ".join(text.split()).strip()
 
 
@@ -60,19 +81,27 @@ def _parse_date(value: Optional[str]) -> Optional[date]:
 def _build_content(record: dict) -> str:
     """Stitch the embeddable passage from the record's text fields.
 
-    Order matters: the vulnerability name goes first because it's the most
-    concise semantic anchor. Short description provides the detail. Required
-    action makes remediation questions answerable. Notes catch everything
-    else (references, context) that CISA chose to include.
+    URLs are stripped out — they end up in metadata.references instead.
     """
     parts = [
-        _clean(record.get("vulnerabilityName")),
-        _clean(record.get("shortDescription")),
-        _clean(record.get("requiredAction")),
-        _clean(record.get("notes")),
+        _clean(_strip_urls(record.get("vulnerabilityName"))),
+        _clean(_strip_urls(record.get("shortDescription"))),
+        _clean(_strip_urls(record.get("requiredAction"))),
+        _clean(_strip_urls(record.get("notes"))),
     ]
-    # drop empty parts and join with a sentence boundary
     return " ".join(p for p in parts if p)
+
+
+def _collect_references(record: dict) -> list[str]:
+    """Pull URLs from every text field, de-duplicated, order preserved."""
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for key in ("vulnerabilityName", "shortDescription", "requiredAction", "notes"):
+        for url in _extract_urls(record.get(key)):
+            if url not in seen:
+                seen.add(url)
+                ordered.append(url)
+    return ordered
 
 
 # ---------------------------------------------------------------------------
@@ -106,8 +135,8 @@ def record_to_document(record: dict) -> Optional[Document]:
         logger.warning(f"{cve_id}: no usable content, skipping")
         return None
 
-    # Normalize the ransomware signal. KEV uses 'Known' / 'Unknown';
-    # anything else gets coerced to None so Pydantic's Literal is happy.
+    references = _collect_references(record)
+
     ransom_raw = record.get("knownRansomwareCampaignUse")
     ransomware_use = ransom_raw if ransom_raw in ("Known", "Unknown") else None
 
@@ -122,6 +151,7 @@ def record_to_document(record: dict) -> Optional[Document]:
             date_added=_parse_date(record.get("dateAdded")),
             due_date=_parse_date(record.get("dueDate")),
             ransomware_use=ransomware_use,
+            references=references,
         )
         return Document(
             document_id=cve_id,
@@ -160,11 +190,11 @@ def main() -> None:
     logger.info(f"Successfully converted {len(documents)} documents")
     write_jsonl(documents)
 
-    # quick preview
     if documents:
         sample = documents[0]
         logger.info(f"Sample document: {sample}")
         logger.info(f"Sample content preview: {sample.content[:200]!r}")
+        logger.info(f"Sample references: {sample.metadata.references}")
 
 
 if __name__ == "__main__":
