@@ -1,0 +1,16 @@
+Metadata-Version: 2.4
+Name: cyberintel-rag
+Version: 0.1.0
+Requires-Python: <3.12,>=3.11
+Requires-Dist: pydantic>=2.5
+Requires-Dist: pydantic-settings>=2.1
+Requires-Dist: python-dotenv>=1.0
+Requires-Dist: loguru>=0.7
+Requires-Dist: httpx>=0.26
+Requires-Dist: requests>=2.31
+Requires-Dist: tqdm>=4.66
+Requires-Dist: orjson>=3.9
+Provides-Extra: dev
+Requires-Dist: pytest>=7.4; extra == "dev"
+Requires-Dist: pytest-cov>=4.1; extra == "dev"
+Requires-Dist: ruff>=0.1; extra == "dev"
