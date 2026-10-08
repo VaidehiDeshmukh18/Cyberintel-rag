@@ -1,18 +1,33 @@
 """Baseline RAG loop — retrieve → prompt → generate → citation-extract.
 
-Pipeline now includes rule-based query understanding BEFORE retrieval:
+Pipeline:
     question
        ↓
-    QueryUnderstanding (regex) → cleaned query + optional qdrant filter
+    QueryUnderstanding (regex) → cleaned query + optional Qdrant filter
        ↓
-    Retriever (vector / hybrid / hybrid+reranker) — uses the filter
+    Retriever (vector / hybrid / hybrid+reranker)
        ↓
-    Prompt builder → LLM → citation extraction → GroundedAnswer
+    SCORE THRESHOLD — drop marginal chunks. Zero survivors → refuse.
+       ↓
+    Prompt builder with <<<SOURCE>>> delimiters + injection defence
+       ↓
+    LLM
+       ↓
+    Citation extraction + hallucinated-citation strip
+       ↓
+    GroundedAnswer
 
-The retriever is a duck type — any object with `.search(query, k, qfilter?)`
-works. The qfilter kwarg is passed if the searcher accepts it (via
-try/except). This keeps the Retriever Protocol minimal while letting
-richer retrievers consume filters.
+Design notes:
+  * The retriever is a duck type — any .search(query, k, qfilter?) works.
+  * The score threshold is on the RERANKER score when the reranker is
+    present. For other searchers it's on their own score, so the default
+    is conservative (0.05) and callers that use a non-reranked retriever
+    can disable it with score_threshold=None.
+  * We never fall back to "top-1 anyway" when the threshold filters all
+    chunks. In cybersecurity, a confidently wrong answer is worse than
+    "I don't know". The threshold-triggered refusal is the Phase 7 win.
+  * Hallucinated [LABEL] citations are soft-stripped from the user-facing
+    answer text, but kept on the GroundedAnswer object for audit.
 """
 
 from __future__ import annotations
@@ -36,7 +51,18 @@ from src.retrieval.vector_search import RetrievedChunk, VectorSearcher
 # ---------------------------------------------------------------------------
 
 DEFAULT_K = 5
-DEFAULT_SCORE_THRESHOLD: Optional[float] = None
+
+# Threshold for a chunk's post-retrieval score to be worth sending to the
+# LLM. Scales:
+#   * RerankedSearcher: 0..1 sigmoid of a cross-encoder logit. 0.05 is
+#     the floor where the model is at least weakly positive.
+#   * HybridSearcher (unreranked): RRF scores are ~0.016–0.033. Set
+#     score_threshold=None when using hybrid directly.
+#   * VectorSearcher: cosine ~0.5–0.9. Threshold would need to be ~0.6.
+#
+# The default here matches the recommended retriever (with_hybrid_rerank).
+# Phase 8 evaluation will tune this against the benchmark.
+DEFAULT_SCORE_THRESHOLD: Optional[float] = 0.05
 
 INSUFFICIENT_EVIDENCE_SENTINEL = (
     "The provided sources do not contain enough information "
@@ -74,7 +100,7 @@ class Retriever(Protocol):
 @dataclass
 class GroundedAnswer:
     question: str
-    answer: str
+    answer: str                              # user-facing (hallucinated cites stripped)
     retrieved: list[RetrievedChunk]
     cited_labels: list[str]
     label_to_chunk: dict[str, RetrievedChunk]
@@ -83,13 +109,15 @@ class GroundedAnswer:
     hallucinated_citations: list[str] = field(default_factory=list)
     retriever_name: str = "unknown"
     query_understanding: Optional[QueryUnderstanding] = None
+    answer_before_strip: Optional[str] = None     # raw LLM text, pre-strip
+    dropped_below_threshold: int = 0               # how many chunks filtered out
 
     def __repr__(self) -> str:
         preview = self.answer[:80].replace("\n", " ")
         return (
             f"GroundedAnswer(retriever={self.retriever_name!r} "
             f"cited={self.cited_labels} "
-            f"retrieved={len(self.retrieved)} "
+            f"retrieved={len(self.retrieved)} dropped={self.dropped_below_threshold} "
             f"insufficient={self.is_insufficient_evidence} "
             f"answer={preview!r}...)"
         )
@@ -124,6 +152,26 @@ def validate_citations(
     return grounded, hallucinated
 
 
+def strip_hallucinated_citations(text: str, hallucinated: list[str]) -> str:
+    """Remove [LABEL] tags for labels the model invented.
+
+    Leaves grounded citations alone. Preserves surrounding whitespace
+    cleanly (no awkward double spaces).
+    """
+    if not hallucinated:
+        return text
+    out = text
+    for label in hallucinated:
+        # Match the exact bracketed label as a token (not a subset).
+        pattern = re.compile(r"\[" + re.escape(label) + r"\]")
+        out = pattern.sub("", out)
+    # Collapse any double spaces created by removals.
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    # Clean orphaned spaces before punctuation like " ." or " ,".
+    out = re.sub(r"\s+([.,;:!?])", r"\1", out)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Refusal detection
 # ---------------------------------------------------------------------------
@@ -139,7 +187,8 @@ def is_insufficient_evidence(answer_text: str, grounded_citations: list[str]) ->
 # ---------------------------------------------------------------------------
 
 class BaselineRAG:
-    """RAG loop with rule-based query understanding + pluggable retriever."""
+    """RAG loop with rule-based query understanding, pluggable retriever,
+    score-threshold refusal, and hallucinated-citation stripping."""
 
     def __init__(
         self,
@@ -153,11 +202,23 @@ class BaselineRAG:
 
     @classmethod
     def with_hybrid(cls, default_k: int = DEFAULT_K) -> "BaselineRAG":
-        return cls(searcher=HybridSearcher(), default_k=default_k)
+        # Hybrid uses RRF scores (~0.016-0.033), so disable threshold here.
+        return cls(
+            searcher=HybridSearcher(),
+            default_k=default_k,
+            score_threshold=None,
+        )
 
     @classmethod
-    def with_hybrid_rerank(cls, default_k: int = DEFAULT_K) -> "BaselineRAG":
-        return cls(searcher=RerankedSearcher(inner=HybridSearcher()), default_k=default_k)
+    def with_hybrid_rerank(
+        cls, default_k: int = DEFAULT_K, score_threshold: float = DEFAULT_SCORE_THRESHOLD,
+    ) -> "BaselineRAG":
+        """Strongest baseline: hybrid + cross-encoder + score threshold."""
+        return cls(
+            searcher=RerankedSearcher(inner=HybridSearcher()),
+            default_k=default_k,
+            score_threshold=score_threshold,
+        )
 
     @property
     def retriever_name(self) -> str:
@@ -169,23 +230,64 @@ class BaselineRAG:
         question: str,
         k: Optional[int] = None,
     ) -> tuple[list[RetrievedChunk], QueryUnderstanding]:
-        """Query-understand first → retrieve with filter → return hits + parse."""
+        """Query-understand → retrieve with filter → return hits + parse."""
         _, qfilter, qu = understand(question)
 
-        # Try with qfilter and score_threshold; fall back for simpler retrievers.
-        search_kwargs = {"k": k or self.default_k}
+        search_kwargs: dict = {"k": k or self.default_k}
         if qfilter is not None:
             search_kwargs["qfilter"] = qfilter
-        if self.score_threshold is not None:
-            search_kwargs["score_threshold"] = self.score_threshold
 
         try:
             hits = self.searcher.search(question, **search_kwargs)
         except TypeError:
-            # Searcher doesn't accept one of the optional kwargs — retry without.
             hits = self.searcher.search(question, k=k or self.default_k)
 
         return hits, qu
+
+    # ------------------------------------------------------------------
+    def _apply_threshold(
+        self,
+        hits: list[RetrievedChunk],
+    ) -> tuple[list[RetrievedChunk], int]:
+        """Drop chunks whose score < threshold. Returns (kept, dropped_count)."""
+        if self.score_threshold is None or not hits:
+            return hits, 0
+        kept = [h for h in hits if h.score >= self.score_threshold]
+        dropped = len(hits) - len(kept)
+        if dropped:
+            logger.debug(
+                f"[RAG:{self.retriever_name}] threshold={self.score_threshold} "
+                f"dropped {dropped} chunks"
+            )
+        return kept, dropped
+
+    # ------------------------------------------------------------------
+    def _refusal(
+        self,
+        question: str,
+        qu: Optional[QueryUnderstanding],
+        dropped: int = 0,
+    ) -> GroundedAnswer:
+        """Build an insufficient-evidence GroundedAnswer. No LLM call."""
+        empty_resp = LLMResponse(
+            text=INSUFFICIENT_EVIDENCE_SENTINEL,
+            model="",
+            provider="",
+            latency_s=0.0,
+        )
+        return GroundedAnswer(
+            question=question,
+            answer=INSUFFICIENT_EVIDENCE_SENTINEL,
+            retrieved=[],
+            cited_labels=[],
+            label_to_chunk={},
+            llm_response=empty_resp,
+            is_insufficient_evidence=True,
+            retriever_name=self.retriever_name,
+            query_understanding=qu,
+            answer_before_strip=INSUFFICIENT_EVIDENCE_SENTINEL,
+            dropped_below_threshold=dropped,
+        )
 
     # ------------------------------------------------------------------
     def answer(
@@ -202,49 +304,41 @@ class BaselineRAG:
             f"retrieved={len(hits)} chunks"
         )
 
+        # Phase 7: score threshold. Zero survivors → refuse without LLM call.
+        hits, dropped = self._apply_threshold(hits)
+
         if not hits:
             logger.warning(
-                f"[RAG:{self.retriever_name}] no chunks (possibly filter too narrow); "
-                "returning insufficient-evidence"
+                f"[RAG:{self.retriever_name}] no chunks above threshold "
+                f"({dropped} dropped); refusing without LLM call"
             )
-            empty_resp = LLMResponse(
-                text=INSUFFICIENT_EVIDENCE_SENTINEL,
-                model="",
-                provider="",
-                latency_s=0.0,
-            )
-            return GroundedAnswer(
-                question=question,
-                answer=INSUFFICIENT_EVIDENCE_SENTINEL,
-                retrieved=[],
-                cited_labels=[],
-                label_to_chunk={},
-                llm_response=empty_resp,
-                is_insufficient_evidence=True,
-                retriever_name=self.retriever_name,
-                query_understanding=qu,
-            )
+            return self._refusal(question, qu, dropped=dropped)
 
+        # Build prompt (now with <<<SOURCE>>> delimiters and injection defence)
         bundle: PromptBundle = build_prompt(question, hits)
 
+        # Generate
         resp = generate(system=bundle.system, user=bundle.user)
         logger.info(
             f"[RAG:{self.retriever_name}] LLM latency={resp.latency_s:.2f}s "
             f"out_tokens={resp.output_tokens}"
         )
 
+        # Post-process: extract and validate citations
         cited = extract_citations(resp.text)
         grounded, hallucinated = validate_citations(cited, bundle.label_to_chunk)
         is_insufficient = is_insufficient_evidence(resp.text, grounded)
 
         if hallucinated:
             logger.warning(
-                f"[RAG:{self.retriever_name}] {len(hallucinated)} hallucinated citation(s): {hallucinated}"
+                f"[RAG:{self.retriever_name}] stripping {len(hallucinated)} "
+                f"hallucinated citation(s): {hallucinated}"
             )
+        stripped = strip_hallucinated_citations(resp.text, hallucinated)
 
         return GroundedAnswer(
             question=question,
-            answer=resp.text,
+            answer=stripped,
             retrieved=hits,
             cited_labels=grounded,
             label_to_chunk=bundle.label_to_chunk,
@@ -253,11 +347,13 @@ class BaselineRAG:
             hallucinated_citations=hallucinated,
             retriever_name=self.retriever_name,
             query_understanding=qu,
+            answer_before_strip=resp.text,
+            dropped_below_threshold=dropped,
         )
 
 
 # ---------------------------------------------------------------------------
-# CLI smoke test — the Phase 6 payoff
+# CLI smoke test
 # ---------------------------------------------------------------------------
 
 def _print_answer(ga: GroundedAnswer) -> None:
@@ -265,7 +361,9 @@ def _print_answer(ga: GroundedAnswer) -> None:
     print("=" * 80)
     print(f"[{ga.retriever_name}] QUESTION: {ga.question}")
     if ga.query_understanding:
-        print(f"PARSED: {ga.query_understanding.summary()}")
+        print(f"PARSED:  {ga.query_understanding.summary()}")
+    if ga.dropped_below_threshold:
+        print(f"DROPPED: {ga.dropped_below_threshold} chunks below threshold")
     print("=" * 80)
     print(ga.answer)
     print()
@@ -277,17 +375,21 @@ def _print_answer(ga: GroundedAnswer) -> None:
             f"score={h.score:.4f}  vendor={h.metadata.vendor!r}"
         )
     print(f"Cited (grounded):      {ga.cited_labels}")
+    print(f"Hallucinated:          {ga.hallucinated_citations}")
     print(f"Insufficient evidence: {ga.is_insufficient_evidence}")
 
 
 def main() -> None:
     rag = BaselineRAG.with_hybrid_rerank()
 
-    # Query 1: no filter — baseline.
-    _print_answer(rag.answer("What is Log4Shell?"))
+    # Query 1: strong match — expect clean answer with 2 citations.
+    _print_answer(rag.answer("What is Log4Shell and how do I remediate it?"))
 
-    # Query 2: filter in action.
+    # Query 2: filter-driven — Apache + ransomware.
     _print_answer(rag.answer("Apache CVEs with known ransomware use"))
+
+    # Query 3: should refuse via threshold (nothing in KEV about this).
+    _print_answer(rag.answer("How do I design a quantum teleportation protocol?"))
 
 
 if __name__ == "__main__":
