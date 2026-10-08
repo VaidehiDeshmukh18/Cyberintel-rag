@@ -3,32 +3,28 @@
 Usage:
     python scripts/eval.py                          # full benchmark, all retrievers
     python scripts/eval.py --limit 5                # sanity run on 5 questions
-    python scripts/eval.py --retrievers hybrid_rerank
+    python scripts/eval.py --retrievers hybrid_rerank_expanded
     python scripts/eval.py --skip-generation        # retrieval-only (faster)
 
 Writes:
     data/eval/results-<timestamp>.csv              per-question rows
     data/eval/report-<timestamp>.md                 human-readable summary
-    data/eval/latest.md                             symlink/copy of the newest report
+    data/eval/latest.md                             copy of the newest report
 
 Design notes:
-  * Each retriever gets its own RAG instance so the smoke-run doesn't
-    bleed state (e.g. BaselineRAG caches the embedder internally, which
-    is fine, but we instantiate fresh anyway).
-  * We skip generation metrics for the vector-only run by default when
-    `--skip-generation` is set — generation is expensive and the retriever
-    comparison is clearest on retrieval metrics alone.
+  * Each retriever gets its own RAG instance. Phase 9 adds an "_expanded"
+    variant per retriever so the ablation table shows the lift from
+    vulnerability-name expansion.
+  * The expansion toggle is a monkey-patch of `_VULNERABILITY_ALIASES`
+    for the duration of one retriever run. Scoped, reverted after.
   * CSV rows are self-describing (retriever + question_id + metric names).
-    Open in a spreadsheet and pivot.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import json
 import sys
-from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -49,6 +45,7 @@ from src.evaluation.retrieval_metrics import (
     aggregate_report,
     score_question,
 )
+from src.generation import query_understanding as qu_mod
 from src.generation.rag import BaselineRAG
 from src.retrieval.hybrid import HybridSearcher
 from src.retrieval.reranker import RerankedSearcher
@@ -62,15 +59,58 @@ from src.retrieval.vector_search import VectorSearcher
 OUT_DIR = Path("data/eval")
 DEFAULT_K = 5
 
-# Retrievers to evaluate — map CLI name → factory returning (searcher, RAG).
-_RETRIEVER_FACTORIES = {
-    "vector":  lambda: BaselineRAG(searcher=VectorSearcher(), score_threshold=None),
-    "hybrid":  lambda: BaselineRAG(searcher=HybridSearcher(), score_threshold=None),
-    "hybrid_rerank": lambda: BaselineRAG(
-        searcher=RerankedSearcher(inner=HybridSearcher()),
-        score_threshold=0.01,
+# Each entry is (rag_factory, expand_aliases_flag).
+# When expand_aliases_flag is False, we monkey-patch _VULNERABILITY_ALIASES
+# to {} for the duration of the run so the baseline rows don't benefit
+# from Phase 9's query expansion.
+_RETRIEVER_FACTORIES: dict[str, tuple] = {
+    # Baselines WITHOUT alias expansion — these reproduce Phase 8 numbers.
+    "vector": (
+        lambda: BaselineRAG(searcher=VectorSearcher(), score_threshold=None),
+        False,
+    ),
+    "hybrid": (
+        lambda: BaselineRAG(searcher=HybridSearcher(), score_threshold=None),
+        False,
+    ),
+    "hybrid_rerank": (
+        lambda: BaselineRAG(
+            searcher=RerankedSearcher(inner=HybridSearcher()),
+            score_threshold=0.01,
+        ),
+        False,
+    ),
+    # Phase 9 variant — hybrid+rerank WITH alias expansion.
+    "hybrid_rerank_expanded": (
+        lambda: BaselineRAG(
+            searcher=RerankedSearcher(inner=HybridSearcher()),
+            score_threshold=0.01,
+        ),
+        True,
     ),
 }
+
+
+# ---------------------------------------------------------------------------
+# Expansion toggle (scoped)
+# ---------------------------------------------------------------------------
+
+class _ExpansionScope:
+    """Context manager that disables _VULNERABILITY_ALIASES for its lifetime."""
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+        self._original: dict[str, str] = {}
+
+    def __enter__(self) -> "_ExpansionScope":
+        if not self.enabled:
+            self._original = dict(qu_mod._VULNERABILITY_ALIASES)
+            qu_mod._VULNERABILITY_ALIASES.clear()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if not self.enabled and self._original:
+            qu_mod._VULNERABILITY_ALIASES.update(self._original)
 
 
 # ---------------------------------------------------------------------------
@@ -93,12 +133,10 @@ def run_one_retriever(
         logger.info(f"[{name}] ({i}/{len(questions)}) {q.id}: {q.question!r}")
 
         if skip_generation:
-            # Retrieval only — faster, cheaper, no LLM calls.
             hits = rag.retrieve(q.question, k=k)[0]
             retrieval_rows.append(score_question(q, hits, k))
             continue
 
-        # Full RAG: retrieval + generation.
         ga = rag.answer(q.question, k=k)
         retrieval_rows.append(score_question(q, ga.retrieved, k))
         try:
@@ -118,7 +156,6 @@ def write_csv(
     all_rows: dict[str, tuple[list[QuestionResult], list[GenerationScore]]],
     k: int,
 ) -> None:
-    """One row per (retriever, question). Join retrieval + generation scores."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
         "retriever", "question_id", "question_type",
@@ -155,7 +192,6 @@ def write_markdown(
     k: int,
     judge_model: str,
 ) -> None:
-    """A human-readable summary — the one you paste into a README."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
     lines: list[str] = []
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -166,7 +202,6 @@ def write_markdown(
     lines.append(f"- Judge model (for faithfulness/relevance): `{judge_model}`")
     lines.append("")
 
-    # Overall table.
     lines.append("## Overall metrics\n")
     lines.append(
         f"| Retriever | n | Recall@{k} | MRR | NDCG@{k} | Faithfulness | Relevance | Refusal Acc |"
@@ -185,7 +220,6 @@ def write_markdown(
         )
     lines.append("")
 
-    # Per-type breakdown for each retriever.
     for name, (rrows, _grows) in all_rows.items():
         rep = aggregate_report(name, rrows, k)
         lines.append(f"## {name} — per question type\n")
@@ -199,7 +233,6 @@ def write_markdown(
             )
         lines.append("")
 
-    # Misses — a short list for debugging.
     lines.append("## Misses by retriever (first 10 each)\n")
     for name, (rrows, _grows) in all_rows.items():
         misses = [r for r in rrows if r.recall_at_k == 0.0 and r.question_type != "unanswerable"]
@@ -242,23 +275,28 @@ def main() -> None:
 
     all_rows: dict[str, tuple[list[QuestionResult], list[GenerationScore]]] = {}
     for name in args.retrievers:
-        logger.info(f"\n{'=' * 70}\nEvaluating retriever: {name}\n{'=' * 70}")
-        rag = _RETRIEVER_FACTORIES[name]()
-        rrows, grows = run_one_retriever(
-            name=name, rag=rag,
-            k=args.k, limit=args.limit,
-            skip_generation=args.skip_generation,
+        factory, expand = _RETRIEVER_FACTORIES[name]
+        logger.info(
+            f"\n{'=' * 70}\n"
+            f"Evaluating retriever: {name}  "
+            f"(expansion={'ON' if expand else 'OFF'})\n"
+            f"{'=' * 70}"
         )
+        with _ExpansionScope(enabled=expand):
+            rag = factory()
+            rrows, grows = run_one_retriever(
+                name=name, rag=rag,
+                k=args.k, limit=args.limit,
+                skip_generation=args.skip_generation,
+            )
         all_rows[name] = (rrows, grows)
 
-        # Live-print the top-line summary after each retriever.
         rep = aggregate_report(name, rrows, args.k)
         logger.info(rep.summary())
         if grows:
             gen = aggregate_generation(name, grows)
             logger.info(gen.summary())
 
-    # Write outputs.
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     csv_path = args.out_dir / f"results-{ts}.csv"
     md_path = args.out_dir / f"report-{ts}.md"
@@ -270,7 +308,6 @@ def main() -> None:
     write_csv(csv_path, all_rows, args.k)
     write_markdown(md_path, all_rows, args.k, judge_model=judge_model)
 
-    # Copy to latest.md for easy pointer-sharing.
     latest_path.write_text(md_path.read_text())
     logger.info(f"✅ Latest: {latest_path}")
 
