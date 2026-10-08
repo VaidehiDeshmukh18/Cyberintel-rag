@@ -62,7 +62,7 @@ DEFAULT_K = 5
 #
 # The default here matches the recommended retriever (with_hybrid_rerank).
 # Phase 8 evaluation will tune this against the benchmark.
-DEFAULT_SCORE_THRESHOLD: Optional[float] = 0.05
+DEFAULT_SCORE_THRESHOLD: Optional[float] = 0.01
 
 INSUFFICIENT_EVIDENCE_SENTINEL = (
     "The provided sources do not contain enough information "
