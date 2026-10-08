@@ -125,10 +125,14 @@ class RerankedSearcher:
         self,
         query: str,
         k: int = DEFAULT_TOP_K,
+        qfilter=None,
     ) -> list[RetrievedChunk]:
         """Fetch wide from inner → rerank → preserve direct pins → top-k."""
         # 1. Candidates from the inner retriever.
-        candidates: list[RetrievedChunk] = self.inner.search(query, k=self.fetch_k)
+        try:
+            candidates = self.inner.search(query, k=self.fetch_k, qfilter=qfilter)
+        except TypeError:
+            candidates = self.inner.search(query, k=self.fetch_k)
         if not candidates:
             return []
 
