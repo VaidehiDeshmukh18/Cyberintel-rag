@@ -11,9 +11,10 @@ They all call `BaselineRAG.answer(question)` and get back a typed
 injected at construction time so tests can swap each one for a fake.
 
 Design notes:
-  * The retriever is now a DUCK TYPE — any object with
+  * The retriever is a DUCK TYPE — any object with
     `.search(query, k) -> list[RetrievedChunk]` works. That's how we
-    get BaselineRAG + HybridSearcher without a subclass or wrapper.
+    get BaselineRAG + HybridSearcher + RerankedSearcher without a
+    subclass or wrapper per combination.
   * Refusal detection uses PHRASE MATCHING + "no citations" rather than
     an exact sentinel string. Small models paraphrase; we accept any
     reasonable refusal as long as it comes with no grounded citations.
@@ -32,6 +33,7 @@ from loguru import logger
 from src.generation.llm_client import LLMResponse, generate
 from src.generation.prompts import PromptBundle, build_prompt
 from src.retrieval.hybrid import HybridSearcher
+from src.retrieval.reranker import RerankedSearcher
 from src.retrieval.vector_search import RetrievedChunk, VectorSearcher
 
 
@@ -68,7 +70,8 @@ _CITATION_RE = re.compile(r"\[([A-Za-z0-9\-#_.]+)\]")
 # ---------------------------------------------------------------------------
 
 class Retriever(Protocol):
-    """Minimal contract. VectorSearcher, BM25Searcher, HybridSearcher all fit."""
+    """Minimal contract. VectorSearcher, BM25Searcher, HybridSearcher,
+    RerankedSearcher all fit."""
     def search(self, query: str, k: int = ...) -> list[RetrievedChunk]: ...
 
 
@@ -147,7 +150,8 @@ def is_insufficient_evidence(answer_text: str, grounded_citations: list[str]) ->
 # ---------------------------------------------------------------------------
 
 class BaselineRAG:
-    """RAG loop. Retriever is pluggable: vector, BM25, or hybrid."""
+    """RAG loop. Retriever is pluggable: vector, BM25, hybrid, or
+    hybrid+reranker."""
 
     def __init__(
         self,
@@ -161,8 +165,17 @@ class BaselineRAG:
 
     @classmethod
     def with_hybrid(cls, default_k: int = DEFAULT_K) -> "BaselineRAG":
-        """Convenience constructor that wires up the hybrid retriever."""
+        """Convenience constructor: hybrid (vector + BM25 + direct ID)."""
         return cls(searcher=HybridSearcher(), default_k=default_k)
+
+    @classmethod
+    def with_hybrid_rerank(cls, default_k: int = DEFAULT_K) -> "BaselineRAG":
+        """Convenience constructor: hybrid + cross-encoder reranker.
+
+        This is the strongest baseline we have — the one the FastAPI and
+        Streamlit layers should default to.
+        """
+        return cls(searcher=RerankedSearcher(inner=HybridSearcher()), default_k=default_k)
 
     @property
     def retriever_name(self) -> str:
@@ -254,7 +267,7 @@ class BaselineRAG:
 
 
 # ---------------------------------------------------------------------------
-# CLI smoke test — side-by-side vector vs hybrid
+# CLI smoke test — side-by-side retriever comparison
 # ---------------------------------------------------------------------------
 
 def _print_answer(ga: GroundedAnswer) -> None:
@@ -275,18 +288,15 @@ def _print_answer(ga: GroundedAnswer) -> None:
 
 
 def main() -> None:
-    vector_rag = BaselineRAG()                 # VectorSearcher default
+    # Three retrievers, same question — see the cumulative gains.
+    vector_rag = BaselineRAG()
     hybrid_rag = BaselineRAG.with_hybrid()
+    rerank_rag = BaselineRAG.with_hybrid_rerank()
 
-    # Query 1: exact CVE ID — this is where hybrid should SHINE
-    q1 = "What is CVE-2021-44228?"
-    _print_answer(vector_rag.answer(q1))
-    _print_answer(hybrid_rag.answer(q1))
-
-    # Query 2: natural prose about a known vuln — both should do fine
-    q2 = "What is Log4Shell and how do I remediate it?"
-    _print_answer(vector_rag.answer(q2))
-    _print_answer(hybrid_rag.answer(q2))
+    q = "What is Log4Shell and how do I remediate it?"
+    _print_answer(vector_rag.answer(q))
+    _print_answer(hybrid_rag.answer(q))
+    _print_answer(rerank_rag.answer(q))
 
 
 if __name__ == "__main__":
