@@ -1,25 +1,18 @@
 """Baseline RAG loop — retrieve → prompt → generate → citation-extract.
 
-This is the single entry point every downstream surface uses:
-    * scripts/ask.py       (CLI)
-    * src/api/routes/      (FastAPI /query)
-    * src/dashboard/pages/ (Streamlit "Ask the AI Analyst")
-    * src/evaluation/      (benchmark harness)
+Pipeline now includes rule-based query understanding BEFORE retrieval:
+    question
+       ↓
+    QueryUnderstanding (regex) → cleaned query + optional qdrant filter
+       ↓
+    Retriever (vector / hybrid / hybrid+reranker) — uses the filter
+       ↓
+    Prompt builder → LLM → citation extraction → GroundedAnswer
 
-They all call `BaselineRAG.answer(question)` and get back a typed
-`GroundedAnswer`. The LLM, the retriever, and the prompt builder are
-injected at construction time so tests can swap each one for a fake.
-
-Design notes:
-  * The retriever is a DUCK TYPE — any object with
-    `.search(query, k) -> list[RetrievedChunk]` works. That's how we
-    get BaselineRAG + HybridSearcher + RerankedSearcher without a
-    subclass or wrapper per combination.
-  * Refusal detection uses PHRASE MATCHING + "no citations" rather than
-    an exact sentinel string. Small models paraphrase; we accept any
-    reasonable refusal as long as it comes with no grounded citations.
-  * The citation regex is intentionally strict — only labels in the
-    form [LABEL] with no spaces are counted.
+The retriever is a duck type — any object with `.search(query, k, qfilter?)`
+works. The qfilter kwarg is passed if the searcher accepts it (via
+try/except). This keeps the Retriever Protocol minimal while letting
+richer retrievers consume filters.
 """
 
 from __future__ import annotations
@@ -32,6 +25,7 @@ from loguru import logger
 
 from src.generation.llm_client import LLMResponse, generate
 from src.generation.prompts import PromptBundle, build_prompt
+from src.generation.query_understanding import QueryUnderstanding, understand
 from src.retrieval.hybrid import HybridSearcher
 from src.retrieval.reranker import RerankedSearcher
 from src.retrieval.vector_search import RetrievedChunk, VectorSearcher
@@ -42,7 +36,7 @@ from src.retrieval.vector_search import RetrievedChunk, VectorSearcher
 # ---------------------------------------------------------------------------
 
 DEFAULT_K = 5
-DEFAULT_SCORE_THRESHOLD: Optional[float] = None  # off by default for baseline
+DEFAULT_SCORE_THRESHOLD: Optional[float] = None
 
 INSUFFICIENT_EVIDENCE_SENTINEL = (
     "The provided sources do not contain enough information "
@@ -66,12 +60,10 @@ _CITATION_RE = re.compile(r"\[([A-Za-z0-9\-#_.]+)\]")
 
 
 # ---------------------------------------------------------------------------
-# Retriever protocol — any .search(query, k) works
+# Retriever protocol
 # ---------------------------------------------------------------------------
 
 class Retriever(Protocol):
-    """Minimal contract. VectorSearcher, BM25Searcher, HybridSearcher,
-    RerankedSearcher all fit."""
     def search(self, query: str, k: int = ...) -> list[RetrievedChunk]: ...
 
 
@@ -81,7 +73,6 @@ class Retriever(Protocol):
 
 @dataclass
 class GroundedAnswer:
-    """What a RAG call returns."""
     question: str
     answer: str
     retrieved: list[RetrievedChunk]
@@ -91,6 +82,7 @@ class GroundedAnswer:
     is_insufficient_evidence: bool = False
     hallucinated_citations: list[str] = field(default_factory=list)
     retriever_name: str = "unknown"
+    query_understanding: Optional[QueryUnderstanding] = None
 
     def __repr__(self) -> str:
         preview = self.answer[:80].replace("\n", " ")
@@ -108,7 +100,6 @@ class GroundedAnswer:
 # ---------------------------------------------------------------------------
 
 def extract_citations(text: str) -> list[str]:
-    """Pull out [LABEL] citations in order of first appearance, deduplicated."""
     seen: set[str] = set()
     out: list[str] = []
     for m in _CITATION_RE.finditer(text):
@@ -123,7 +114,6 @@ def validate_citations(
     cited: list[str],
     available: dict[str, RetrievedChunk],
 ) -> tuple[list[str], list[str]]:
-    """Split cited labels into (grounded, hallucinated)."""
     grounded: list[str] = []
     hallucinated: list[str] = []
     for label in cited:
@@ -139,7 +129,6 @@ def validate_citations(
 # ---------------------------------------------------------------------------
 
 def is_insufficient_evidence(answer_text: str, grounded_citations: list[str]) -> bool:
-    """Detect a refusal, regardless of exact wording."""
     text = answer_text.lower()
     hit_phrase = any(p in text for p in _INSUFFICIENT_PHRASES)
     return hit_phrase and not grounded_citations
@@ -150,8 +139,7 @@ def is_insufficient_evidence(answer_text: str, grounded_citations: list[str]) ->
 # ---------------------------------------------------------------------------
 
 class BaselineRAG:
-    """RAG loop. Retriever is pluggable: vector, BM25, hybrid, or
-    hybrid+reranker."""
+    """RAG loop with rule-based query understanding + pluggable retriever."""
 
     def __init__(
         self,
@@ -165,16 +153,10 @@ class BaselineRAG:
 
     @classmethod
     def with_hybrid(cls, default_k: int = DEFAULT_K) -> "BaselineRAG":
-        """Convenience constructor: hybrid (vector + BM25 + direct ID)."""
         return cls(searcher=HybridSearcher(), default_k=default_k)
 
     @classmethod
     def with_hybrid_rerank(cls, default_k: int = DEFAULT_K) -> "BaselineRAG":
-        """Convenience constructor: hybrid + cross-encoder reranker.
-
-        This is the strongest baseline we have — the one the FastAPI and
-        Streamlit layers should default to.
-        """
         return cls(searcher=RerankedSearcher(inner=HybridSearcher()), default_k=default_k)
 
     @property
@@ -186,18 +168,24 @@ class BaselineRAG:
         self,
         question: str,
         k: Optional[int] = None,
-    ) -> list[RetrievedChunk]:
-        """Just the retrieval step — exposed so callers can inspect it."""
-        # score_threshold is a VectorSearcher-specific kwarg; only pass
-        # it when the searcher actually accepts it.
+    ) -> tuple[list[RetrievedChunk], QueryUnderstanding]:
+        """Query-understand first → retrieve with filter → return hits + parse."""
+        _, qfilter, qu = understand(question)
+
+        # Try with qfilter and score_threshold; fall back for simpler retrievers.
+        search_kwargs = {"k": k or self.default_k}
+        if qfilter is not None:
+            search_kwargs["qfilter"] = qfilter
+        if self.score_threshold is not None:
+            search_kwargs["score_threshold"] = self.score_threshold
+
         try:
-            return self.searcher.search(
-                question,
-                k=k or self.default_k,
-                score_threshold=self.score_threshold,  # type: ignore[call-arg]
-            )
+            hits = self.searcher.search(question, **search_kwargs)
         except TypeError:
-            return self.searcher.search(question, k=k or self.default_k)
+            # Searcher doesn't accept one of the optional kwargs — retry without.
+            hits = self.searcher.search(question, k=k or self.default_k)
+
+        return hits, qu
 
     # ------------------------------------------------------------------
     def answer(
@@ -208,13 +196,17 @@ class BaselineRAG:
         """Full RAG loop. Returns a GroundedAnswer every caller can use."""
         logger.info(f"[RAG:{self.retriever_name}] question: {question!r}")
 
-        # 1. Retrieve
-        hits = self.retrieve(question, k=k)
-        logger.info(f"[RAG:{self.retriever_name}] retrieved {len(hits)} chunks")
+        hits, qu = self.retrieve(question, k=k)
+        logger.info(
+            f"[RAG:{self.retriever_name}] parsed: {qu.summary()}  "
+            f"retrieved={len(hits)} chunks"
+        )
 
-        # Edge case: nothing came back. Short-circuit — no LLM call.
         if not hits:
-            logger.warning(f"[RAG:{self.retriever_name}] no chunks; returning insufficient-evidence")
+            logger.warning(
+                f"[RAG:{self.retriever_name}] no chunks (possibly filter too narrow); "
+                "returning insufficient-evidence"
+            )
             empty_resp = LLMResponse(
                 text=INSUFFICIENT_EVIDENCE_SENTINEL,
                 model="",
@@ -230,22 +222,19 @@ class BaselineRAG:
                 llm_response=empty_resp,
                 is_insufficient_evidence=True,
                 retriever_name=self.retriever_name,
+                query_understanding=qu,
             )
 
-        # 2. Build prompt
         bundle: PromptBundle = build_prompt(question, hits)
 
-        # 3. Generate
         resp = generate(system=bundle.system, user=bundle.user)
         logger.info(
             f"[RAG:{self.retriever_name}] LLM latency={resp.latency_s:.2f}s "
             f"out_tokens={resp.output_tokens}"
         )
 
-        # 4. Post-process: extract and validate citations
         cited = extract_citations(resp.text)
         grounded, hallucinated = validate_citations(cited, bundle.label_to_chunk)
-
         is_insufficient = is_insufficient_evidence(resp.text, grounded)
 
         if hallucinated:
@@ -263,40 +252,42 @@ class BaselineRAG:
             is_insufficient_evidence=is_insufficient,
             hallucinated_citations=hallucinated,
             retriever_name=self.retriever_name,
+            query_understanding=qu,
         )
 
 
 # ---------------------------------------------------------------------------
-# CLI smoke test — side-by-side retriever comparison
+# CLI smoke test — the Phase 6 payoff
 # ---------------------------------------------------------------------------
 
 def _print_answer(ga: GroundedAnswer) -> None:
     print()
     print("=" * 80)
     print(f"[{ga.retriever_name}] QUESTION: {ga.question}")
+    if ga.query_understanding:
+        print(f"PARSED: {ga.query_understanding.summary()}")
     print("=" * 80)
     print(ga.answer)
     print()
     print("-" * 80)
     print(f"Retrieved chunks ({len(ga.retrieved)}):")
     for h in ga.retrieved:
-        print(f"  - [{h.metadata.cve_id or h.document_id}] score={h.score:.4f}")
+        print(
+            f"  - [{h.metadata.cve_id or h.document_id}] "
+            f"score={h.score:.4f}  vendor={h.metadata.vendor!r}"
+        )
     print(f"Cited (grounded):      {ga.cited_labels}")
-    print(f"Hallucinated:          {ga.hallucinated_citations}")
     print(f"Insufficient evidence: {ga.is_insufficient_evidence}")
-    print(f"LLM latency:           {ga.llm_response.latency_s:.2f} s")
 
 
 def main() -> None:
-    # Three retrievers, same question — see the cumulative gains.
-    vector_rag = BaselineRAG()
-    hybrid_rag = BaselineRAG.with_hybrid()
-    rerank_rag = BaselineRAG.with_hybrid_rerank()
+    rag = BaselineRAG.with_hybrid_rerank()
 
-    q = "What is Log4Shell and how do I remediate it?"
-    _print_answer(vector_rag.answer(q))
-    _print_answer(hybrid_rag.answer(q))
-    _print_answer(rerank_rag.answer(q))
+    # Query 1: no filter — baseline.
+    _print_answer(rag.answer("What is Log4Shell?"))
+
+    # Query 2: filter in action.
+    _print_answer(rag.answer("Apache CVEs with known ransomware use"))
 
 
 if __name__ == "__main__":

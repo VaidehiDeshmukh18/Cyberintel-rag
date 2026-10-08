@@ -1,5 +1,6 @@
 """Hybrid retrieval = Vector + BM25 → Reciprocal Rank Fusion
                    + Direct ID lookup for exact CVE/CWE/MITRE IDs.
+                   + Optional metadata filter applied uniformly to all paths.
 
 Why hybrid: vector search is strong at semantic similarity, BM25 is
 strong at exact-term matching. Each fails where the other succeeds.
@@ -17,13 +18,12 @@ Why RRF (Reciprocal Rank Fusion), not score-weighted sum:
   * Normalizing requires per-corpus tuning; RRF needs none.
   * RRF is one line, well-studied, used in Elasticsearch/Vespa/Qdrant.
 
-Design notes:
-  * `k` (the RRF smoothing constant) is 60 — the original paper's default.
-  * Each sub-retriever is called for a wider `fetch_k` (default 20),
-    then RRF selects the final `top_k` (default 10). Wider fetch =
-    better fusion.
-  * Direct-lookup hits always rank above fused hits. Users who typed
-    an explicit ID want THAT chunk first.
+Filter handling:
+  * Vector sub-searcher runs the filter server-side via Qdrant.
+  * BM25 has no native filter, so we score first then drop any chunk
+    whose metadata doesn't satisfy the filter — client-side.
+  * Direct-lookup also respects the filter: a query asking for
+    'CVE-2021-44228 from Microsoft' won't surface an Apache chunk.
 
 Usage:
     python -m src.retrieval.hybrid
@@ -33,12 +33,15 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import date
 from typing import Optional
 
 from loguru import logger
+from qdrant_client.http import models as qmodels
 
 from src.retrieval.bm25_search import BM25Searcher
 from src.retrieval.vector_search import RetrievedChunk, VectorSearcher
+from src.utils.schemas import DocumentMetadata
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +73,50 @@ def _ids_in_query(query: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Client-side filter evaluation (for BM25 and direct-lookup paths)
+# ---------------------------------------------------------------------------
+
+def _chunk_matches_filter(
+    md: DocumentMetadata,
+    qfilter: Optional[qmodels.Filter],
+) -> bool:
+    """Replay a Qdrant Filter in Python against one chunk's metadata.
+
+    Supports exactly what `build_filter()` produces: a `must` list of
+    `FieldCondition`s with either a `MatchValue` or a `DatetimeRange(gte=...)`.
+    Anything more exotic falls through as True — we'd rather over-return
+    than silently drop results we didn't predict.
+    """
+    if qfilter is None or not qfilter.must:
+        return True
+
+    md_dict = md.model_dump(mode="json")
+
+    for cond in qfilter.must:
+        key = cond.key
+        value = md_dict.get(key)
+
+        if cond.match is not None:
+            if value != cond.match.value:
+                return False
+
+        elif cond.range is not None:
+            # DatetimeRange with gte (what our filter builder produces)
+            if value is None:
+                return False
+            # Compare lexically — ISO date strings sort correctly.
+            gte = cond.range.gte
+            if gte is None:
+                continue
+            # Qdrant model stores gte as datetime; normalize both sides.
+            gte_str = gte.date().isoformat() if hasattr(gte, "date") else str(gte)[:10]
+            if str(value)[:10] < gte_str:
+                return False
+
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Fusion
 # ---------------------------------------------------------------------------
 
@@ -87,14 +134,7 @@ def reciprocal_rank_fusion(
     bm25_hits: list[RetrievedChunk],
     rrf_k: int = RRF_K,
 ) -> list[_FusedEntry]:
-    """Merge two ranked lists with Reciprocal Rank Fusion.
-
-    Formula per unique chunk:
-        score = sum(1 / (rrf_k + rank_in_list)) over the lists it appears in
-
-    Ranks are 1-based. A chunk at rank 1 in both lists gets 2 * (1 / 61);
-    at rank 1 in A only gets 1 * (1 / 61).
-    """
+    """Merge two ranked lists with Reciprocal Rank Fusion."""
     fused: dict[str, _FusedEntry] = {}
 
     for rank, hit in enumerate(vector_hits, start=1):
@@ -113,7 +153,6 @@ def reciprocal_rank_fusion(
         entry.rrf_score += 1.0 / (rrf_k + rank)
         entry.bm25_rank = rank
 
-    # Sort descending by fused score, deterministic tiebreak by chunk_id.
     return sorted(
         fused.values(),
         key=lambda e: (-e.rrf_score, e.chunk.chunk_id),
@@ -125,14 +164,8 @@ def reciprocal_rank_fusion(
 # ---------------------------------------------------------------------------
 
 class HybridSearcher:
-    """Vector + BM25 fused with RRF, with a direct-lookup fast path for
-    queries that contain explicit CVE/CWE/MITRE IDs.
-
-    Output is the same list[RetrievedChunk] shape as the sub-retrievers,
-    so BaselineRAG / HybridRAG can treat them interchangeably. The
-    `score` field on each returned chunk is the fused RRF score (or 1.0
-    for a direct-lookup hit, which signals "exact match, not similarity").
-    """
+    """Vector + BM25 fused with RRF, with a direct-lookup fast path and
+    an optional metadata filter applied uniformly across all paths."""
 
     DIRECT_LOOKUP_SCORE = 1.0
 
@@ -149,26 +182,32 @@ class HybridSearcher:
         self.rrf_k = rrf_k
 
     # ------------------------------------------------------------------
-    def _direct_lookup(self, ids: list[str]) -> list[RetrievedChunk]:
+    def _direct_lookup(
+        self,
+        ids: list[str],
+        qfilter: Optional[qmodels.Filter] = None,
+    ) -> list[RetrievedChunk]:
         """Fetch chunks whose document_id matches any of `ids`, directly
-        from the BM25 index's in-memory payload — no scoring, no ranking.
+        from the BM25 index's in-memory payload — then apply the filter.
         """
         if not ids:
             return []
         wanted = {i.upper() for i in ids}
         hits: list[RetrievedChunk] = []
         for i, payload in enumerate(self.bm25.index.payloads):
-            if payload["document_id"].upper() in wanted:
-                from src.utils.schemas import DocumentMetadata
-                md = DocumentMetadata(**payload["metadata"])
-                hits.append(RetrievedChunk(
-                    chunk_id=payload["chunk_id"],
-                    document_id=payload["document_id"],
-                    chunk_index=payload["chunk_index"],
-                    text=self.bm25.index.texts[i],
-                    score=self.DIRECT_LOOKUP_SCORE,
-                    metadata=md,
-                ))
+            if payload["document_id"].upper() not in wanted:
+                continue
+            md = DocumentMetadata(**payload["metadata"])
+            if not _chunk_matches_filter(md, qfilter):
+                continue
+            hits.append(RetrievedChunk(
+                chunk_id=payload["chunk_id"],
+                document_id=payload["document_id"],
+                chunk_index=payload["chunk_index"],
+                text=self.bm25.index.texts[i],
+                score=self.DIRECT_LOOKUP_SCORE,
+                metadata=md,
+            ))
         return hits
 
     # ------------------------------------------------------------------
@@ -176,11 +215,12 @@ class HybridSearcher:
         self,
         query: str,
         k: int = DEFAULT_TOP_K,
+        qfilter: Optional[qmodels.Filter] = None,
     ) -> list[RetrievedChunk]:
         """Run direct-ID lookup (if any), vector + BM25 in parallel, fuse."""
         # 1. If the query names explicit IDs, pull those chunks directly.
         q_ids = _ids_in_query(query)
-        direct_hits = self._direct_lookup(q_ids)
+        direct_hits = self._direct_lookup(q_ids, qfilter=qfilter)
         if direct_hits:
             logger.debug(
                 f"[hybrid] direct-lookup hits for {q_ids}: "
@@ -188,8 +228,19 @@ class HybridSearcher:
             )
 
         # 2. Wider candidate pool from each retriever.
-        v_hits = self.vector.search(query, k=self.fetch_k)
-        b_hits = self.bm25.search(query, k=self.fetch_k)
+        v_hits = self.vector.search(query, k=self.fetch_k, qfilter=qfilter)
+        b_hits_raw = self.bm25.search(query, k=self.fetch_k)
+
+        # BM25 can't filter natively — do it client-side.
+        if qfilter is not None:
+            b_hits = [h for h in b_hits_raw if _chunk_matches_filter(h.metadata, qfilter)]
+            if len(b_hits) < len(b_hits_raw):
+                logger.debug(
+                    f"[hybrid] filtered BM25 pool: {len(b_hits_raw)} → {len(b_hits)}"
+                )
+        else:
+            b_hits = b_hits_raw
+
         logger.debug(f"[hybrid] vector={len(v_hits)} bm25={len(b_hits)}")
 
         # 3. Fuse the two ranked lists with RRF.
@@ -233,44 +284,33 @@ def _print(label: str, hits: list[RetrievedChunk]) -> None:
     for i, h in enumerate(hits, 1):
         preview = h.text[:85].replace("\n", " ")
         print(f"  {i}. {h.chunk_id:40s} score={h.score:.4f} "
-              f"vendor={h.metadata.vendor!r}")
+              f"vendor={h.metadata.vendor!r} ransom={h.metadata.ransomware_use!r}")
         print(f"     {preview}...")
 
 
 def main() -> None:
+    from src.retrieval.vector_search import build_filter
     hybrid = HybridSearcher()
 
-    # Query A: exact CVE ID — direct-lookup must put Log4Shell at #1.
-    _print(
-        "Query A — exact ID: 'CVE-2021-44228'",
-        hybrid.search("CVE-2021-44228", k=5),
-    )
+    # Query A: no filter — baseline.
+    _print("Query A — no filter: 'remote code execution'",
+           hybrid.search("remote code execution", k=5))
 
-    # Query B: product name — fusion handles it.
-    _print(
-        "Query B — product name: 'Log4j2 remote code execution'",
-        hybrid.search("Log4j2 remote code execution", k=5),
-    )
+    # Query B: Apache-only — all top hits should be Apache.
+    _print("Query B — vendor=Apache: 'remote code execution'",
+           hybrid.search("remote code execution", k=5,
+                         qfilter=build_filter(vendor="Apache")))
 
-    # Query C: fuzzy prose — vector carries, BM25 noise diluted.
-    _print(
-        "Query C — fuzzy prose: 'how do I protect my servers from attackers?'",
-        hybrid.search("how do I protect my servers from attackers?", k=5),
-    )
+    # Query C: ransomware-only — all top hits should have ransom='Known'.
+    _print("Query C — ransomware only: 'remote code execution'",
+           hybrid.search("remote code execution", k=5,
+                         qfilter=build_filter(ransomware_only=True)))
 
-    # Query D: semantic + implicit domain — confirms vector-first queries
-    # still work.
-    _print(
-        "Query D — semantic: 'ransomware exploitation of enterprise VPN'",
-        hybrid.search("ransomware exploitation of enterprise VPN", k=5),
-    )
-
-    # Query E: narrative with an ID embedded — should pin the correct
-    # chunk at #1 AND surface semantically related ones below.
-    _print(
-        "Query E — ID in prose: 'tell me about CVE-2021-44228 and related RCEs'",
-        hybrid.search("tell me about CVE-2021-44228 and related RCEs", k=5),
-    )
+    # Query D: explicit ID + mismatched filter — direct lookup should
+    # return nothing because the CVE isn't from Microsoft.
+    _print("Query D — 'CVE-2021-44228' + vendor=Microsoft (mismatch)",
+           hybrid.search("CVE-2021-44228", k=5,
+                         qfilter=build_filter(vendor="Microsoft")))
 
 
 if __name__ == "__main__":
