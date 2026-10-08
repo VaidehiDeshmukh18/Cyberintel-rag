@@ -15,6 +15,8 @@ Design notes:
     reduces noise.
   * The index is pickled to disk after build, so the next process load
     is milliseconds instead of re-tokenizing 1,734 chunks every time.
+  * The pickled class is `BM25Index` (no leading underscore) so pickle
+    resolves it cleanly across modules on load.
   * Scores returned by rank_bm25 are UNBOUNDED (not 0..1). The hybrid
     layer will normalize via reciprocal rank fusion rather than raw
     scores, so we don't need to.
@@ -97,12 +99,16 @@ def _iter_chunks(path: Path = CHUNKS_PATH) -> Iterator[Chunk]:
 # Index payload — what we pickle to disk
 # ---------------------------------------------------------------------------
 
-class _BM25Index:
+class BM25Index:
     """Everything we need at search time, packaged for pickling.
 
+    Public name (no leading underscore) so pickle resolves the class
+    cleanly across modules — pickles store the fully-qualified class
+    name and look it up by import on load.
+
     We DON'T pickle the Chunk objects directly — too fat. Instead we keep
-    a parallel list of (chunk_id, text, payload_dict) and rebuild
-    RetrievedChunk objects on demand.
+    parallel lists of (chunk_id, text, payload_dict) and rebuild
+    RetrievedChunk objects on demand at query time.
     """
 
     def __init__(
@@ -128,7 +134,7 @@ class _BM25Index:
 def build_index(
     in_path: Path = CHUNKS_PATH,
     out_path: Path = INDEX_PATH,
-) -> _BM25Index:
+) -> BM25Index:
     """Tokenize every chunk, build BM25, pickle to disk."""
     chunk_ids: list[str] = []
     texts: list[str] = []
@@ -150,7 +156,7 @@ def build_index(
                 f"{sum(len(t) for t in tokenized) / max(len(tokenized), 1):.1f})")
 
     bm25 = BM25Okapi(tokenized)
-    index = _BM25Index(bm25=bm25, chunk_ids=chunk_ids, texts=texts, payloads=payloads)
+    index = BM25Index(bm25=bm25, chunk_ids=chunk_ids, texts=texts, payloads=payloads)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("wb") as f:
@@ -160,7 +166,7 @@ def build_index(
     return index
 
 
-def load_index(path: Path = INDEX_PATH) -> _BM25Index:
+def load_index(path: Path = INDEX_PATH) -> BM25Index:
     """Load a pickled BM25 index. Rebuilds if missing."""
     if not path.exists():
         logger.warning(f"BM25 index missing at {path}; building now...")
@@ -178,7 +184,7 @@ def load_index(path: Path = INDEX_PATH) -> _BM25Index:
 class BM25Searcher:
     """Lexical searcher with the same output contract as VectorSearcher."""
 
-    def __init__(self, index: Optional[_BM25Index] = None) -> None:
+    def __init__(self, index: Optional[BM25Index] = None) -> None:
         self.index = index or load_index()
 
     def search(
