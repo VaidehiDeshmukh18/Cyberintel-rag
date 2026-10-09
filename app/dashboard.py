@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import streamlit as st
 
 # Page registry — order and labels controlled here, not by filesystem.
-from app.views import ask_ai, cve_risk, retrieval_debugger, source_explorer, threat_search  # 1. First page we're building this turn.
+from app.views import ask_ai, cve_risk, eval_report, retrieval_debugger, source_explorer, threat_search  # 1. First page we're building this turn.
 
 PAGES = {
     "💬 Ask AI Analyst":    ask_ai.render,
@@ -35,6 +35,7 @@ PAGES = {
     "📚 Source Explorer":     source_explorer.render,
     "🎯 CVE Risk Analysis": cve_risk.render,
     "🧪 Retrieval Debugger":  retrieval_debugger.render,
+    "📊 Eval Report":         eval_report.render,
     # Will be added in subsequent turns:
     # "💬 Ask AI Analyst":    ask_ai.render,
     # "🔍 Threat Intel Search": threat_search.render,
