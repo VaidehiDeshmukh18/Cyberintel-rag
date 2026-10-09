@@ -1,0 +1,61 @@
+# Three-service stack for CyberIntel-RAG.
+#   qdrant     — vector database with persisted storage
+#   ollama     — LLM runtime, pre-pulls llama3.2 on first start
+#   dashboard  — Streamlit app, our custom image
+#
+# Usage:
+#   docker-compose up                  # start everything (first run: ~5 min for Ollama model pull)
+#   docker-compose up -d               # detached
+#   docker-compose logs -f dashboard   # tail dashboard logs
+#   docker-compose down                # stop; data volumes persist
+#   docker-compose down -v             # stop and WIPE data (fresh start)
+#
+# After `up`: open http://localhost:8501
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: cyberintel-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - ./data/indexes/qdrant:/qdrant/storage
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: cyberintel-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    # Pre-pull the model on first start so the dashboard isn't waiting
+    # the first time a user asks a question.
+    entrypoint: >
+      sh -c "ollama serve &
+             sleep 3 &&
+             (ollama list | grep -q llama3.2 || ollama pull llama3.2:latest) &&
+             wait"
+    restart: unless-stopped
+
+  dashboard:
+    build: .
+    container_name: cyberintel-dashboard
+    depends_on:
+      - qdrant
+      - ollama
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data          # chunks, documents, risk model, eval reports
+      - ./results:/app/results    # tracked reports for the README
+    environment:
+      - QDRANT_URL=http://qdrant:6333
+      - OLLAMA_URL=http://ollama:11434
+      - LLM_PROVIDER=ollama
+      - LLM_MODEL=llama3.2:latest
+
+volumes:
+  ollama-models:
+    driver: local
