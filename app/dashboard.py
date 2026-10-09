@@ -27,9 +27,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import streamlit as st
 
 # Page registry — order and labels controlled here, not by filesystem.
-from app.views import cve_risk  # 1. First page we're building this turn.
+from app.views import ask_ai, cve_risk  # 1. First page we're building this turn.
 
 PAGES = {
+    "💬 Ask AI Analyst":    ask_ai.render,
     "🎯 CVE Risk Analysis": cve_risk.render,
     # Will be added in subsequent turns:
     # "💬 Ask AI Analyst":    ask_ai.render,
