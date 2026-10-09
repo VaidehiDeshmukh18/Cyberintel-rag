@@ -1,0 +1,32 @@
+{
+  "n_samples": 1734,
+  "n_features": 30,
+  "n_positives": 361,
+  "positive_rate": 0.20818915801614762,
+  "cv_folds": 5,
+  "roc_auc_mean": 0.7409547671495477,
+  "roc_auc_std": 0.026963161758908314,
+  "pr_auc_mean": 0.42111004736848645,
+  "pr_auc_std": 0.06530379851265272,
+  "precision_at_default_threshold": 0.3568075117370892,
+  "recall_at_default_threshold": 0.631578947368421,
+  "f1_at_default_threshold": 0.456,
+  "confusion_matrix": [
+    [
+      962,
+      411
+    ],
+    [
+      133,
+      228
+    ]
+  ],
+  "rf_params": {
+    "n_estimators": 200,
+    "max_depth": null,
+    "min_samples_leaf": 2,
+    "class_weight": "balanced",
+    "n_jobs": -1,
+    "random_state": 42
+  }
+}
